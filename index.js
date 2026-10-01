@@ -1,7 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { spawn } = require('child_process');
 
-// Environment variable se Bot Token read karein
 const token = process.env.BOT_TOKEN;
 if (!token) {
   console.error("FATAL: BOT_TOKEN Environment Variable is missing!");
@@ -10,21 +9,20 @@ if (!token) {
 
 const bot = new TelegramBot(token, { polling: true });
 
-// User states & active processes management
 const userSessions = new Map();
 const activeStreams = new Map();
 
 console.log("Telegram Live Stream Bot started successfully...");
 
-// 1. /start Command Handler
+// 1. /start Command
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  userSessions.delete(chatId); // Reset user state
+  userSessions.delete(chatId);
 
   const welcomeMessage = 
     `👋 *Welcome to RTMP Restreamer Bot!*\n\n` +
-    `Yeh bot aapki live stream link ko direct YouTube Live par restream karta hai.\n\n` +
-    `Aapke phone ka internet ya screen off rehne par bhi live stream chalti rahegi.`;
+    `Yeh bot aapki live stream ko direct YouTube Live par restream karta hai.\n\n` +
+    `Aap direct YouTube link (\`https://www.youtube.com/live/...\`) ya koi bhi \`.m3u8\` link bhej sakte hain.`;
 
   const opts = {
     parse_mode: 'Markdown',
@@ -39,18 +37,18 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(chatId, welcomeMessage, opts);
 });
 
-// 2. Callback Query Handler (Button Clicks)
+// 2. Callback Query Handler (Buttons)
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const action = query.data;
 
   if (action === 'init_stream') {
     if (activeStreams.has(chatId)) {
-      bot.answerCallbackQuery(query.id, { text: "⚠️️ You already have an active stream running!" });
+      bot.answerCallbackQuery(query.id, { text: "⚠ You already have an active stream running!" });
       return;
     }
     userSessions.set(chatId, { step: 'AWAITING_SOURCE_URL' });
-    bot.sendMessage(chatId, "🔗 Please send your **Source Live Stream URL** (.m3u8, RTMP, or direct media link):", { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, "🔗 Please send your **Source Live Stream Link** (YouTube URL, .m3u8, RTMP, or direct media link):", { parse_mode: 'Markdown' });
   } 
 
   else if (action === 'start_live') {
@@ -71,12 +69,11 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id);
 });
 
-// 3. Message Listener for Inputs
+// 3. Text Message Handler
 bot.on('message', (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  // Skip commands like /start
   if (!text || text.startsWith('/')) return;
 
   const session = userSessions.get(chatId);
@@ -116,28 +113,61 @@ bot.on('message', (msg) => {
   }
 });
 
-// 4. FFmpeg Stream Spawning Function
+// 4. Stream Handler with yt-dlp & FFmpeg
 function startFfmpegStream(chatId, sourceUrl, streamKey) {
   const youtubeRtmpUrl = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-  // FFmpeg arguments using stream passthrough (-c copy)
+  bot.sendMessage(chatId, "⏳ Processing source link and setting up stream...");
+
+  // Agar YouTube Link hai toh yt-dlp se fresh M3U8 link extract karein
+  if (sourceUrl.includes('youtube.com') || sourceUrl.includes('youtu.be')) {
+    const ytDlpProcess = spawn('yt-dlp', ['-g', '-f', 'best', sourceUrl]);
+
+    let extractedUrl = '';
+
+    ytDlpProcess.stdout.on('data', (data) => {
+      extractedUrl += data.toString();
+    });
+
+    ytDlpProcess.stderr.on('data', (err) => {
+      console.error(`[yt-dlp log \({chatId}]:\){err.toString()}`);
+    });
+
+    ytDlpProcess.on('close', (code) => {
+      const realM3u8Url = extractedUrl.trim().split('\n')[0]; // First stream URL
+
+      if (code === 0 && realM3u8Url) {
+        runFFmpeg(chatId, realM3u8Url, youtubeRtmpUrl);
+      } else {
+        bot.sendMessage(chatId, "❌ Failed to extract stream URL from YouTube link. Make sure the stream is live.");
+      }
+    });
+
+  } else {
+    // Regular M3U8 / MP4 Link
+    runFFmpeg(chatId, sourceUrl, youtubeRtmpUrl);
+  }
+}
+
+function runFFmpeg(chatId, mediaUrl, targetRtmp) {
   const ffmpegArgs = [
     '-re',
-    '-i', sourceUrl,
-    '-c', 'copy',
+    '-i', mediaUrl,
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-maxrate', '3000k',
+    '-bufsize', '6000k',
+    '-c:a', 'aac',
+    '-ar', '44100',
     '-f', 'flv',
-    youtubeRtmpUrl
+    targetRtmp
   ];
-
-  bot.sendMessage(chatId, "🚀 Spawning FFmpeg process on cloud server... Connecting to YouTube Live...");
 
   const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
   activeStreams.set(chatId, ffmpegProcess);
 
-  // FFmpeg status monitoring
   ffmpegProcess.stderr.on('data', (data) => {
-    // Optionally log FFmpeg outputs to server console
-    console.log(`[FFmpeg \({chatId}]:\){data.toString()}`);
+    console.log(`[FFmpeg Log \({chatId}]:\){data.toString()}`);
   });
 
   ffmpegProcess.on('close', (code) => {
@@ -163,7 +193,7 @@ function startFfmpegStream(chatId, sourceUrl, streamKey) {
   bot.sendMessage(chatId, "⚡ *LIVE NOW!* Your stream is actively relaying to YouTube Live.", { parse_mode: 'Markdown', ...stopOpts });
 }
 
-// 5. Stop FFmpeg Process
+// 5. Stop Stream
 function stopFfmpegStream(chatId) {
   const ffmpegProcess = activeStreams.get(chatId);
   if (ffmpegProcess) {
